@@ -4,7 +4,11 @@
     <img src="https://img.shields.io/badge/CCDS-Project%20template-328F97?logo=cookiecutter" />
 </a>
 
-A short description of the project.
+# DengAI: Predicting Disease Spread
+
+## Project Overview
+This project focuses on forecasting dengue fever cases using weather and disease data from two cities. The goal is to build models that help predict outbreaks and assist in public health planning.
+
 
 ## Project Organization
 
