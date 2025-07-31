@@ -104,7 +104,29 @@ test_mae = mean_absolute_error(y_test, y_pred)
 
 print(f"Test MAE: {test_mae:.2f}")
 
-# Optional: You can switch to GradientBoostingRegressor by replacing pipeline regressor like:
-# pipeline.set_params(regressor=GradientBoostingRegressor(random_state=42))
-# and update param_grid accordingly
+# === New part: retrain best model on entire training data ===
+# Extract best hyperparameters
+best_params = grid_search.best_params_
 
+# Rebuild the pipeline with best params
+final_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="mean")),
+    ("scaler", StandardScaler()),
+    ("regressor", RandomForestRegressor(
+        n_estimators=best_params["regressor__n_estimators"],
+        max_depth=best_params["regressor__max_depth"],
+        min_samples_split=best_params["regressor__min_samples_split"],
+        random_state=42,
+        n_jobs=-1
+    ))
+])
+
+# Fit on the entire training data (X_train, y_train)
+final_pipeline.fit(X_train, y_train)
+
+print("Final model trained on the entire training data.")
+
+# Save the final trained model for future use
+import joblib
+joblib.dump(final_pipeline, "final_best_model.pkl")
+print("Final model saved to 'final_best_model.pkl'.")
