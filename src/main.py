@@ -1,132 +1,172 @@
 import pandas as pd
 import numpy as np
-
+import joblib
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error
-
 from warnings import filterwarnings
+
 filterwarnings("ignore")
 
-# Load data
-train_features = pd.read_csv(
-    "data/raw/dengue_features_train.csv", index_col=[0, 1, 2]
-)
-train_labels = pd.read_csv(
-    "data/raw/dengue_labels_train.csv", index_col=[0, 1, 2]
-)
+# === Utility functions ===
 
-# Prepare San Juan data
-sj_features = train_features.loc["sj"].copy()
-sj_labels = train_labels.loc["sj"].copy()
-
-sj_features.drop("week_start_date", axis=1, inplace=True)
-sj_features.fillna(method="ffill", inplace=True)
-
-sj_features["total_cases"] = sj_labels["total_cases"]
-
-# Features to use
-base_features = [
-    "reanalysis_specific_humidity_g_per_kg",
-    "reanalysis_dew_point_temp_k",
-    "station_avg_temp_c",
-    "station_min_temp_c"
-]
-
-# Create lag features for each base feature (1 and 2 weeks lag)
 def create_lag_features(df, features, lags=[1, 2]):
     df_lag = df.copy()
     for feature in features:
         for lag in lags:
             df_lag[f"{feature}_lag{lag}"] = df_lag[feature].shift(lag)
-    df_lag.dropna(inplace=True)  # drop rows with NaNs created by lagging
+    # Instead of dropna, fill missing lag values (first rows) with forward fill or 0
+    df_lag.fillna(method="ffill", inplace=True)
+    df_lag.fillna(0, inplace=True)  # in case ffill fails for first rows
     return df_lag
 
-sj_features_lagged = create_lag_features(sj_features, base_features)
+def preprocess_features(features, labels=None):
+    # Drop date column if present
+    if "week_start_date" in features.columns:
+        features = features.drop("week_start_date", axis=1)
+    # Forward fill missing values
+    features.fillna(method="ffill", inplace=True)
+    features.fillna(0, inplace=True)
 
-# Define features after lagging
-lagged_features = base_features.copy()
-for f in base_features:
-    for lag in [1, 2]:
-        lagged_features.append(f"{f}_lag{lag}")
+    # Create lag features
+    base_features = [
+        "reanalysis_specific_humidity_g_per_kg",
+        "reanalysis_dew_point_temp_k",
+        "station_avg_temp_c",
+        "station_min_temp_c"
+    ]
+    features_lagged = create_lag_features(features, base_features)
 
-# Split into train/test
-train_size = 800
-sj_train = sj_features_lagged.iloc[:train_size]
-sj_test = sj_features_lagged.iloc[train_size:]
+    # Features to keep (base + lagged)
+    lagged_features = base_features.copy()
+    for f in base_features:
+        for lag in [1, 2]:
+            lagged_features.append(f"{f}_lag{lag}")
 
-X_train = sj_train[lagged_features]
-y_train = sj_train["total_cases"]
+    if labels is not None:
+        # Align labels by index and add
+        features_lagged["total_cases"] = labels.loc[features_lagged.index]["total_cases"]
 
-X_test = sj_test[lagged_features]
-y_test = sj_test["total_cases"]
+    return features_lagged, lagged_features
 
-# Pipeline setup
-pipeline = Pipeline([
-    ("imputer", SimpleImputer(strategy="mean")),
-    ("scaler", StandardScaler()),
-    ("regressor", RandomForestRegressor(random_state=42, n_jobs=-1))
-])
+def train_and_save_model(city, train_features, train_labels, filename):
+    # Prepare city-specific data
+    city_features = train_features.loc[city].copy()
+    city_labels = train_labels.loc[city].copy()
 
-# Hyperparameter grid for RandomForest
-param_grid = {
-    "regressor__n_estimators": [100, 200],
-    "regressor__max_depth": [5, 10, None],
-    "regressor__min_samples_split": [2, 5],
-}
+    # Preprocess features & labels
+    city_features_lagged, lagged_features = preprocess_features(city_features, city_labels)
 
-# TimeSeries cross-validator
-tscv = TimeSeriesSplit(n_splits=5)
+    X_train = city_features_lagged[lagged_features]
+    y_train = city_features_lagged["total_cases"]
 
-# Grid search with time series split
-grid_search = GridSearchCV(
-    estimator=pipeline,
-    param_grid=param_grid,
-    cv=tscv,
-    scoring='neg_mean_absolute_error',
-    n_jobs=-1,
-    verbose=2
-)
+    pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="mean")),
+        ("scaler", StandardScaler()),
+        ("regressor", RandomForestRegressor(random_state=42, n_jobs=-1))
+    ])
 
-# Fit grid search
-grid_search.fit(X_train, y_train)
+    param_grid = {
+        "regressor__n_estimators": [100, 200],
+        "regressor__max_depth": [5, 10, None],
+        "regressor__min_samples_split": [2, 5]
+    }
 
-print("Best parameters:", grid_search.best_params_)
-print("Best CV MAE:", -grid_search.best_score_)
+    tscv = TimeSeriesSplit(n_splits=5)
 
-# Evaluate on test set
-best_model = grid_search.best_estimator_
-y_pred = best_model.predict(X_test)
-test_mae = mean_absolute_error(y_test, y_pred)
+    grid_search = GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        cv=tscv,
+        scoring="neg_mean_absolute_error",
+        n_jobs=-1,
+        verbose=2
+    )
 
-print(f"Test MAE: {test_mae:.2f}")
+    grid_search.fit(X_train, y_train)
+    print(f"{city} Best parameters:", grid_search.best_params_)
+    print(f"{city} Best CV MAE:", -grid_search.best_score_)
 
-# === New part: retrain best model on entire training data ===
-# Extract best hyperparameters
-best_params = grid_search.best_params_
+    # Train final model with best params
+    best_params = grid_search.best_params_
+    final_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="mean")),
+        ("scaler", StandardScaler()),
+        ("regressor", RandomForestRegressor(
+            n_estimators=best_params["regressor__n_estimators"],
+            max_depth=best_params["regressor__max_depth"],
+            min_samples_split=best_params["regressor__min_samples_split"],
+            random_state=42,
+            n_jobs=-1
+        ))
+    ])
+    final_pipeline.fit(X_train, y_train)
 
-# Rebuild the pipeline with best params
-final_pipeline = Pipeline([
-    ("imputer", SimpleImputer(strategy="mean")),
-    ("scaler", StandardScaler()),
-    ("regressor", RandomForestRegressor(
-        n_estimators=best_params["regressor__n_estimators"],
-        max_depth=best_params["regressor__max_depth"],
-        min_samples_split=best_params["regressor__min_samples_split"],
-        random_state=42,
-        n_jobs=-1
-    ))
-])
+    # Save model
+    joblib.dump(final_pipeline, filename)
+    print(f"{city} final model saved to {filename}\n")
 
-# Fit on the entire training data (X_train, y_train)
-final_pipeline.fit(X_train, y_train)
+    return lagged_features  # Return features for test processing
 
-print("Final model trained on the entire training data.")
+def preprocess_test_data(test_filepath, lagged_features_sj, lagged_features_iq):
+    test_features = pd.read_csv(test_filepath, index_col=[0,1,2])
 
-# Save the final trained model for future use
-import joblib
-joblib.dump(final_pipeline, "final_best_model.pkl")
-print("Final model saved to 'final_best_model.pkl'.")
+    # Separate cities
+    sj_test = test_features.loc["sj"].copy()
+    iq_test = test_features.loc["iq"].copy()
+
+    # Drop date column and fill missing
+    for df in [sj_test, iq_test]:
+        if "week_start_date" in df.columns:
+            df.drop("week_start_date", axis=1, inplace=True)
+        df.fillna(method="ffill", inplace=True)
+        df.fillna(0, inplace=True)
+
+    # Create lag features without dropping rows
+    sj_test_lagged = create_lag_features(sj_test, lagged_features_sj[:4])
+    iq_test_lagged = create_lag_features(iq_test, lagged_features_iq[:4])
+
+    # Select only required features (all lagged features)
+    sj_test_lagged = sj_test_lagged[lagged_features_sj]
+    iq_test_lagged = iq_test_lagged[lagged_features_iq]
+
+    return sj_test_lagged, iq_test_lagged
+
+def main():
+    # Load train data
+    train_features = pd.read_csv("data/raw/dengue_features_train.csv", index_col=[0, 1, 2])
+    train_labels = pd.read_csv("data/raw/dengue_labels_train.csv", index_col=[0, 1, 2])
+
+    # Train models and get lagged features list
+    lagged_features_sj = train_and_save_model("sj", train_features, train_labels, "final_best_model_sj.pkl")
+    lagged_features_iq = train_and_save_model("iq", train_features, train_labels, "final_best_model_iq.pkl")
+
+    # Load trained models
+    sj_model = joblib.load("final_best_model_sj.pkl")
+    iq_model = joblib.load("final_best_model_iq.pkl")
+
+    # Preprocess test data
+    sj_test, iq_test = preprocess_test_data("data/raw/dengue_features_test.csv", lagged_features_sj, lagged_features_iq)
+
+    # Predict
+    sj_preds = sj_model.predict(sj_test).astype(int)
+    iq_preds = iq_model.predict(iq_test).astype(int)
+
+    # Load submission with multi-index to align by index
+    submission = pd.read_csv("data/raw/submission_format.csv", index_col=[0,1,2])
+
+    # Assign predictions by aligning index (no length mismatch)
+    submission.loc["sj", "total_cases"] = sj_preds
+    submission.loc["iq", "total_cases"] = iq_preds
+
+    # Save submission CSV (reset index if needed)
+    submission.reset_index(inplace=True)
+    submission.to_csv("data/raw/benchmark.csv", index=False)
+    print("✅ Submission saved as data/raw/benchmark.csv")
+
+if __name__ == "__main__":
+    main()
+
